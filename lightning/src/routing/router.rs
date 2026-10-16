@@ -358,12 +358,14 @@ pub struct InFlightHtlcs(
 	// key is less than its destination. See `InFlightHtlcs::used_liquidity_msat` for more
 	// details.
 	HashMap<(u64, bool), u64>,
+	// RGB units already committed to each directed channel.
+	HashMap<(u64, bool), u64>,
 );
 
 impl InFlightHtlcs {
 	/// Constructs an empty `InFlightHtlcs`.
 	#[rustfmt::skip]
-	pub fn new() -> Self { InFlightHtlcs(new_hash_map()) }
+	pub fn new() -> Self { InFlightHtlcs(new_hash_map(), new_hash_map()) }
 
 	/// Takes in a path with payer's node id and adds the path's details to `InFlightHtlcs`.
 	#[rustfmt::skip]
@@ -389,6 +391,10 @@ impl InFlightHtlcs {
 		// the total amount sent.
 		for (next_hop, prev_hop) in path.hops.iter().rev().zip(reversed_hops_with_payer) {
 			cumulative_msat += next_hop.fee_msat;
+			if let Some((_, amount)) = next_hop.rgb_payment {
+				self.1.entry((next_hop.short_channel_id, NodeId::from_pubkey(&prev_hop) < NodeId::from_pubkey(&next_hop.pubkey)))
+					.and_modify(|used| *used = used.saturating_add(amount)).or_insert(amount);
+			}
 			self.0
 				.entry((next_hop.short_channel_id, NodeId::from_pubkey(&prev_hop) < NodeId::from_pubkey(&next_hop.pubkey)))
 				.and_modify(|used_liquidity_msat| *used_liquidity_msat += cumulative_msat)
@@ -407,6 +413,11 @@ impl InFlightHtlcs {
 			.or_insert(used_msat);
 	}
 
+	/// Returns RGB units already in flight through the directed channel.
+	pub fn used_liquidity_rgb(&self, source: &NodeId, target: &NodeId, channel_scid: u64) -> Option<u64> {
+		self.1.get(&(channel_scid, source < target)).copied()
+	}
+
 	/// Returns liquidity in msat given the public key of the HTLC source, target, and short channel
 	/// id.
 	pub fn used_liquidity_msat(
@@ -418,13 +429,13 @@ impl InFlightHtlcs {
 
 impl Writeable for InFlightHtlcs {
 	#[rustfmt::skip]
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> { self.0.write(writer) }
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> { self.0.write(writer)?; self.1.write(writer) }
 }
 
 impl Readable for InFlightHtlcs {
 	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
 		let infight_map: HashMap<(u64, bool), u64> = Readable::read(reader)?;
-		Ok(Self(infight_map))
+		Ok(Self(infight_map, Readable::read(reader)?))
 	}
 }
 
@@ -3845,8 +3856,13 @@ where L::Target: Logger {
 // destination, if the remaining CLTV expiry delta exactly matches a feasible path in the network
 // graph. In order to improve privacy, this method obfuscates the CLTV expiry deltas along the
 // payment path by adding a randomized 'shadow route' offset to the final hop.
+/// Applies the randomized CLTV privacy offset also used by [`find_route`].
+///
+/// Custom routers can call this after constructing valid paths. It does not select paths.
+/// Every path must be nonempty and its total CLTV delta must already be within
+/// [`PaymentParameters::max_total_cltv_expiry_delta`].
 #[rustfmt::skip]
-fn add_random_cltv_offset(route: &mut Route, payment_params: &PaymentParameters,
+pub fn add_random_cltv_offset(route: &mut Route, payment_params: &PaymentParameters,
 	network_graph: &ReadOnlyNetworkGraph, random_seed_bytes: &[u8; 32]
 ) {
 	let network_channels = network_graph.channels();
