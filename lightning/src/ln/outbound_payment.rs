@@ -13,6 +13,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{self, Secp256k1, SecretKey};
 use lightning_invoice::Bolt11Invoice;
+use rgb_lib::ContractId;
 
 use crate::blinded_path::{IntroductionNode, NodeIdLookUp};
 use crate::events::{self, PaidBolt12Invoice, PaymentFailureReason};
@@ -131,6 +132,10 @@ pub(crate) enum PendingOutboundPayment {
 		bolt12_invoice: Option<PaidBolt12Invoice>,
 		custom_tlvs: Vec<(u64, Vec<u8>)>,
 		pending_amt_msat: u64,
+		/// RGB amount currently committed to in-flight paths.
+		pending_rgb_amount: u64,
+		/// Total RGB amount to deliver across all paths.
+		total_rgb_payment: Option<(ContractId, u64)>,
 		/// Used to track the fee paid. Present iff the payment was serialized on 0.0.103+.
 		pending_fee_msat: Option<u64>,
 		/// The total payment amount across all paths, used to verify that a retry is not overpaying.
@@ -338,11 +343,13 @@ impl PendingOutboundPayment {
 		};
 		if remove_res {
 			if let PendingOutboundPayment::Retryable {
-				ref mut pending_amt_msat, ref mut pending_fee_msat,
+				ref mut pending_amt_msat, ref mut pending_rgb_amount, ref mut pending_fee_msat,
 				ref mut remaining_max_total_routing_fee_msat, ..
 			} = self {
 				let path = path.expect("Removing a failed payment should always come with a path");
 				*pending_amt_msat -= path.final_value_msat();
+				*pending_rgb_amount -= path.hops.last().and_then(|hop| hop.rgb_payment)
+					.map_or(0, |(_, amount)| amount);
 				let path_fee_msat = path.fee_msat();
 				if let Some(fee_msat) = pending_fee_msat.as_mut() {
 					*fee_msat -= path_fee_msat;
@@ -372,10 +379,12 @@ impl PendingOutboundPayment {
 		};
 		if insert_res {
 			if let PendingOutboundPayment::Retryable {
-				ref mut pending_amt_msat, ref mut pending_fee_msat,
+				ref mut pending_amt_msat, ref mut pending_rgb_amount, ref mut pending_fee_msat,
 				ref mut remaining_max_total_routing_fee_msat, ..
 			} = self {
 					*pending_amt_msat += path.final_value_msat();
+					*pending_rgb_amount += path.hops.last().and_then(|hop| hop.rgb_payment)
+						.map_or(0, |(_, amount)| amount);
 					let path_fee_msat = path.fee_msat();
 					if let Some(fee_msat) = pending_fee_msat.as_mut() {
 						*fee_msat += path_fee_msat;
@@ -1002,7 +1011,13 @@ impl OutboundPayments {
 		let payment_params = PaymentParameters::from_bolt11_invoice(invoice)
 			.with_user_config_ignoring_fee_limit(route_params_config);
 
-		let rgb_payment = invoice.rgb_contract_id().zip(invoice.rgb_amount());
+		let rgb_payment = invoice.rgb_contract_id().zip(invoice.rgb_amount()).or_else(|| {
+			let path = get_rgb_payment_info_path(&payment_hash, &self.ldk_data_dir, false);
+			path.exists().then(|| {
+				let info = parse_rgb_payment_info(&path);
+				(info.contract_id, info.amount)
+			})
+		});
 
 		let mut route_params = RouteParameters::from_payment_params_and_value(payment_params, amount, rgb_payment);
 
@@ -1402,7 +1417,7 @@ impl OutboundPayments {
 			for (pmt_id, pmt) in outbounds.iter_mut() {
 				if pmt.is_auto_retryable_now() {
 					if let PendingOutboundPayment::Retryable {
-						pending_amt_msat,
+						pending_amt_msat, pending_rgb_amount, total_rgb_payment,
 						total_msat,
 						payment_params: Some(params),
 						payment_hash,
@@ -1410,14 +1425,8 @@ impl OutboundPayments {
 						..
 					} = pmt
 					{
-						let rgb_payment_info_path =
-							get_rgb_payment_info_path(payment_hash, &self.ldk_data_dir, false);
-						let rgb_payment = if rgb_payment_info_path.exists() {
-							let rgb_payment_info = parse_rgb_payment_info(&rgb_payment_info_path);
-							Some((rgb_payment_info.contract_id, rgb_payment_info.amount))
-						} else {
-							None
-						};
+						let rgb_payment = total_rgb_payment.map(|(contract, amount)|
+							(contract, amount.saturating_sub(*pending_rgb_amount)));
 						if pending_amt_msat < total_msat {
 							retry_id_route_params = Some((
 								*payment_hash,
@@ -2015,6 +2024,8 @@ impl OutboundPayments {
 			payment_params,
 			session_privs: new_hash_set(),
 			pending_amt_msat: 0,
+			pending_rgb_amount: 0,
+			total_rgb_payment: route.route_params.as_ref().and_then(|p| p.rgb_payment),
 			pending_fee_msat: Some(0),
 			payment_hash,
 			payment_secret: recipient_onion.payment_secret,
@@ -2742,6 +2753,9 @@ impl OutboundPayments {
 					bolt12_invoice: None, // only used for retries, and we'll never retry on startup!
 					custom_tlvs: Vec::new(), // only used for retries, and we'll never retry on startup
 					pending_amt_msat: path_amt,
+					pending_rgb_amount: path.hops.last().and_then(|hop| hop.rgb_payment)
+						.map_or(0, |(_, amount)| amount),
+					total_rgb_payment: path.hops.last().and_then(|hop| hop.rgb_payment),
 					pending_fee_msat: Some(path_fee),
 					total_msat: path_amt,
 					starting_block_height: best_block_height,
@@ -2828,6 +2842,8 @@ impl_writeable_tlv_based_enum_upgradable!(PendingOutboundPayment,
 		(11, remaining_max_total_routing_fee_msat, option),
 		(13, invoice_request, option),
 		(15, bolt12_invoice, option),
+		(17, pending_rgb_amount, (default_value, 0)),
+		(19, total_rgb_payment, option),
 		(not_written, retry_strategy, (static_value, None)),
 		(not_written, attempts, (static_value, PaymentAttempts::new())),
 	},

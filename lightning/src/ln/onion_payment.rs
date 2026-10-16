@@ -384,7 +384,8 @@ pub(super) fn create_recv_pending_htlc_info(
 			});
 		},
 		(None, None) => {},
-		(Some(x), Some(y)) if x <= y => {},
+		(Some((expected_contract, expected_amount)), Some((received_contract, received_amount)))
+			if expected_contract == received_contract && expected_amount <= received_amount => {},
 		_ => {
 			return Err(InboundHTLCErr {
 				reason: LocalHTLCFailureReason::RgbFinalIncorrectHTLCAmount,

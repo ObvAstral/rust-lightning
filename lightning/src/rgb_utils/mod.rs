@@ -225,6 +225,7 @@ pub fn is_tx_colored(tx: &Transaction) -> bool {
 pub(crate) fn color_commitment<SP: Deref>(
 	channel_context: &ChannelContext<SP>, funding_scope: &FundingScope,
 	commitment_transaction: &mut CommitmentTransaction, counterparty: bool,
+	rgb_balances: (u64, u64),
 ) -> Result<(), ChannelError>
 where
 	<SP as std::ops::Deref>::Target: SignerProvider,
@@ -240,7 +241,6 @@ where
 	let chan_id = channel_id.0.as_hex();
 	let mut rgb_offered_htlc = 0;
 	let mut rgb_received_htlc = 0;
-	let mut last_rgb_payment_info = None;
 	let mut output_map = HashMap::new();
 
 	for htlc in commitment_transaction.nondust_htlcs() {
@@ -278,9 +278,7 @@ where
 			fs::remove_file(rgb_payment_info_tmp_path).expect("able to remove file");
 		}
 
-		let rgb_payment_info = if rgb_payment_info_proxy_id_path.exists() {
-			parse_rgb_payment_info(&rgb_payment_info_proxy_id_path)
-		} else {
+		if !rgb_payment_info_proxy_id_path.exists() {
 			let rgb_payment_info = RgbPaymentInfo {
 				contract_id,
 				amount: htlc_amount_rgb,
@@ -293,30 +291,31 @@ where
 				serde_json::to_string(&rgb_payment_info).expect("valid rgb payment info");
 			fs::write(rgb_payment_info_proxy_id_path, serialized_info.clone())
 				.expect("able to write rgb payment info file");
-			fs::write(rgb_payment_info_path, serialized_info)
-				.expect("able to write rgb payment info file");
-			rgb_payment_info
-		};
+			// Another MPP channel may already have the sender's payment-wide metadata.
+			// Preserve its original total and swap flag for subsequent paths and retries.
+			if !rgb_payment_info_path.exists() {
+				fs::write(rgb_payment_info_path, serialized_info)
+					.expect("able to write rgb payment info file");
+			}
+		}
 
 		if inbound {
-			rgb_received_htlc += rgb_payment_info.amount
+			rgb_received_htlc += htlc_amount_rgb
 		} else {
-			rgb_offered_htlc += rgb_payment_info.amount
+			rgb_offered_htlc += htlc_amount_rgb
 		};
 
-		output_map.insert(htlc_vout, rgb_payment_info.amount);
-
-		last_rgb_payment_info = Some(rgb_payment_info);
+		output_map.insert(htlc_vout, htlc_amount_rgb);
 	}
 
-	let (local_amt, remote_amt) = if let Some(last_rgb_payment_info) = last_rgb_payment_info {
-		(
-			last_rgb_payment_info.local_rgb_amount - rgb_offered_htlc,
-			last_rgb_payment_info.remote_rgb_amount - rgb_received_htlc,
-		)
-	} else {
-		(rgb_info.local_rgb_amount, rgb_info.remote_rgb_amount)
-	};
+	// Use the balances for this exact commitment view. Per-payment snapshots can
+	// belong to another part, or predate successful/failed HTLC removals.
+	let local_amt = rgb_balances.0.checked_sub(rgb_offered_htlc).ok_or_else(|| {
+		ChannelError::close("Insufficient RGB for outbound HTLC outputs".to_owned())
+	})?;
+	let remote_amt = rgb_balances.1.checked_sub(rgb_received_htlc).ok_or_else(|| {
+		ChannelError::close("Insufficient RGB for inbound HTLC outputs".to_owned())
+	})?;
 	let (vout_p2wpkh_amt, vout_p2wsh_amt) =
 		if counterparty { (local_amt, remote_amt) } else { (remote_amt, local_amt) };
 
@@ -764,7 +763,9 @@ pub(crate) fn filter_first_hops(
 		let serialized_info = fs::read_to_string(info_file_path).expect("valid rgb info file");
 		let rgb_info: RgbInfo =
 			serde_json::from_str(&serialized_info).expect("valid rgb info file");
-		rgb_info.contract_id == contract_id && rgb_info.local_rgb_amount >= rgb_amount
+		// Path finding assigns a part of the payment to each channel. A channel only
+		// needs some RGB liquidity at this stage, not the whole payment amount.
+		rgb_info.contract_id == contract_id && rgb_info.local_rgb_amount > 0
 	});
 	(contract_id, rgb_amount)
 }

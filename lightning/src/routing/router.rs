@@ -463,7 +463,8 @@ pub struct RouteHop {
 	///
 	/// Will be `true` for objects serialized with LDK version 0.0.116 and before.
 	pub maybe_announced_channel: bool,
-	/// How much to pay the node.
+	/// The payment value carried by this path, excluding routing fees. Each hop uses the
+	/// path's value so onion construction can add the fees owed at that hop.
 	pub payment_amount: u64,
 	/// RGB payment to send to the following node
 	pub rgb_payment: Option<(ContractId, u64)>,
@@ -2562,6 +2563,12 @@ where L::Target: Logger {
 	if payment_params.max_path_count == 0 {
 		return Err("Can't find a route with no paths allowed.");
 	}
+	if route_params.rgb_payment.is_some_and(|(_, amount)| amount == 0) {
+		return Err("Cannot route a zero-amount RGB payment");
+	}
+	let max_rgb_path_count = route_params.rgb_payment
+		.map_or(payment_params.max_path_count as u64, |(_, amount)|
+			amount.min(payment_params.max_path_count as u64));
 
 	// Allow MPP only if we have a features set from somewhere that indicates the payee supports
 	// it. If the payee supports it they're supposed to include it in the invoice, so that should
@@ -2718,7 +2725,11 @@ where L::Target: Logger {
 	// return it immediately. Otherwise, we don't stop searching for paths until we have 3x the
 	// amount we want in total across paths, selecting the best subset at the end.
 	const ROUTE_CAPACITY_PROVISION_FACTOR: u64 = 3;
-	let recommended_value_msat = final_value_msat * ROUTE_CAPACITY_PROVISION_FACTOR as u64;
+	let recommended_value_msat = if route_params.rgb_payment.is_some() {
+		final_value_msat
+	} else {
+		final_value_msat * ROUTE_CAPACITY_PROVISION_FACTOR as u64
+	};
 	let mut path_value_msat = final_value_msat;
 
 	// Routing Fragmentation Mitigation heuristic:
@@ -2731,7 +2742,7 @@ where L::Target: Logger {
 	// This requirement is currently set to be 1/max_path_count of the payment
 	// value to ensure we only ever return routes that do not violate this limit.
 	let minimal_value_contribution_msat: u64 = if allow_mpp {
-		(final_value_msat + (payment_params.max_path_count as u64 - 1)) / payment_params.max_path_count as u64
+		(final_value_msat + max_rgb_path_count - 1) / max_rgb_path_count
 	} else {
 		final_value_msat
 	};
@@ -2757,6 +2768,8 @@ where L::Target: Logger {
 	// is used. Hence, liquidity used in one direction will not offset any used in the opposite
 	// direction.
 	let mut used_liquidities: HashMap<CandidateHopId, u64> =
+		hash_map_with_capacity(network_nodes.len());
+	let mut used_rgb_liquidities: HashMap<CandidateHopId, u64> =
 		hash_map_with_capacity(network_nodes.len());
 
 	// Keeping track of how much value we already collected across other paths. Helps to decide
@@ -2881,8 +2894,10 @@ where L::Target: Logger {
 					};
 
 					let mut contributes_sufficient_rgb_value = true;
-					if let Some(rgb_amount) = route_params.rgb_payment.map(|(_, amt)| amt) {
-						if $candidate.effective_capacity_rgb() < rgb_amount {
+					if route_params.rgb_payment.is_some() {
+						let available_rgb = $candidate.effective_capacity_rgb()
+							.saturating_sub(*used_rgb_liquidities.get(&$candidate.id()).unwrap_or(&0));
+						if available_rgb == 0 {
 							contributes_sufficient_rgb_value = false;
 						}
 					}
@@ -3499,8 +3514,33 @@ where L::Target: Logger {
 				debug_assert_eq!(payment_path.get_value_msat(), value_contribution_msat);
 				let (lowest_value_contrib_hop, max_path_contribution_msat) =
 					payment_path.max_final_value_msat(&used_liquidities, channel_saturation_pow_half);
-				let desired_value_contribution = cmp::min(max_path_contribution_msat, final_value_msat);
+				let mut desired_value_contribution = cmp::min(max_path_contribution_msat, final_value_msat);
+				if let Some((_, total_rgb)) = route_params.rgb_payment {
+					let available_rgb = payment_path.hops.iter().map(|(hop, _)| {
+						hop.candidate.effective_capacity_rgb()
+							.saturating_sub(*used_rgb_liquidities.get(&hop.candidate.id()).unwrap_or(&0))
+					}).min().unwrap_or(0);
+					let rgb_limited_msat = ((available_rgb as u128)
+						.saturating_mul(final_value_msat as u128) / total_rgb as u128)
+						.min(u64::MAX as u128) as u64;
+					desired_value_contribution = desired_value_contribution.min(rgb_limited_msat);
+				}
+				if desired_value_contribution == 0 { continue 'path_construction; }
 				value_contribution_msat = payment_path.update_value_and_recompute_fees(desired_value_contribution);
+				if let Some((_, total_rgb)) = route_params.rgb_payment {
+					let reserved_rgb = ((value_contribution_msat as u128 * total_rgb as u128)
+						.saturating_add(final_value_msat as u128 - 1) / final_value_msat as u128) as u64;
+					if payment_path.hops.iter().any(|(hop, _)| {
+						let used = *used_rgb_liquidities.get(&hop.candidate.id()).unwrap_or(&0);
+						hop.candidate.effective_capacity_rgb().saturating_sub(used) < reserved_rgb
+					}) {
+						continue 'path_construction;
+					}
+					for (hop, _) in payment_path.hops.iter() {
+						let used = used_rgb_liquidities.entry(hop.candidate.id()).or_default();
+						*used = used.saturating_add(reserved_rgb);
+					}
+				}
 
 				// Since a path allows to transfer as much value as
 				// the smallest channel it has ("bottleneck"), we should recompute
@@ -3729,7 +3769,7 @@ where L::Target: Logger {
 				fee_msat: hop.fee_msat,
 				cltv_expiry_delta: hop.candidate.cltv_expiry_delta(),
 				maybe_announced_channel,
-				payment_amount: final_value_msat,
+				payment_amount: payment_path.get_value_msat(),
 				rgb_payment: None,
 			});
 		}
@@ -3761,6 +3801,30 @@ where L::Target: Logger {
 	if let Some(node_features) = payment_params.payee.node_features() {
 		for path in paths.iter_mut() {
 			path.hops.last_mut().unwrap().node_features = node_features.clone();
+		}
+	}
+
+	if let Some((contract_id, total_rgb)) = route_params.rgb_payment {
+		let mut remaining_rgb = total_rgb;
+		let mut remaining_msat = final_value_msat;
+		for path in paths.iter_mut() {
+			let part_msat = path.final_value_msat();
+			if part_msat == 0 || part_msat > remaining_msat {
+				return Err("Invalid RGB MPP route amount");
+			}
+			let part_rgb = ((part_msat as u128 * remaining_rgb as u128)
+				.saturating_add(remaining_msat as u128 - 1) / remaining_msat as u128) as u64;
+			if part_rgb == 0 || part_rgb > remaining_rgb {
+				return Err("Not enough RGB units for every payment path");
+			}
+			for hop in path.hops.iter_mut() {
+				hop.rgb_payment = Some((contract_id, part_rgb));
+			}
+			remaining_rgb -= part_rgb;
+			remaining_msat -= part_msat;
+		}
+		if remaining_rgb != 0 || remaining_msat != 0 {
+			return Err("Invalid RGB MPP route total");
 		}
 	}
 

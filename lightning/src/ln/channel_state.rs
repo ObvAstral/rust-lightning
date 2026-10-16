@@ -602,8 +602,8 @@ impl ChannelDetails {
 			channel_shutdown_state: Some(context.shutdown_state()),
 			pending_inbound_htlcs: context.get_pending_inbound_htlc_details(funding),
 			pending_outbound_htlcs: context.get_pending_outbound_htlc_details(funding),
-			next_outbound_htlc_limit_rgb: context.get_local_rgb_amount(),
-			inbound_htlc_maximum_rgb: context.get_remote_rgb_amount(),
+			next_outbound_htlc_limit_rgb: context.available_outbound_rgb(),
+			inbound_htlc_maximum_rgb: context.available_inbound_rgb(),
 		}
 	}
 }

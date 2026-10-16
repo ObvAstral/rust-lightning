@@ -267,6 +267,8 @@ pub struct ClaimedHTLC {
 	/// This value will always be 0 for [`ClaimedHTLC`]s serialized with LDK versions prior to
 	/// 0.0.119.
 	pub counterparty_skimmed_fee_msat: u64,
+	/// RGB asset and amount received in this HTLC, if any.
+	pub rgb_payment: Option<(rgb_lib::ContractId, u64)>,
 }
 impl_writeable_tlv_based!(ClaimedHTLC, {
 	(0, channel_id, required),
@@ -275,6 +277,7 @@ impl_writeable_tlv_based!(ClaimedHTLC, {
 	(3, counterparty_node_id, option),
 	(4, cltv_expiry, required),
 	(6, value_msat, required),
+	(8, rgb_payment, option),
 });
 
 /// When the payment path failure took place and extra details about it. [`PathFailure::OnPath`] may

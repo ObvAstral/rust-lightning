@@ -566,6 +566,7 @@ impl From<&ClaimableHTLC> for events::ClaimedHTLC {
 			cltv_expiry: val.cltv_expiry,
 			value_msat: val.value,
 			counterparty_skimmed_fee_msat: val.counterparty_skimmed_fee_msat.unwrap_or(0),
+			rgb_payment: val.prev_hop.htlc_rgb_payment,
 		}
 	}
 }
@@ -3161,6 +3162,24 @@ const _CHECK_CLTV_EXPIRY_OFFCHAIN: () = assert!(
 /// The number of ticks of [`ChannelManager::timer_tick_occurred`] until expiry of incomplete MPPs
 pub(crate) const MPP_TIMEOUT_TICKS: u8 = 3;
 
+/// Experimental final-hop onion TLV carrying the total RGB amount of an MPP set.
+/// Every part of the set carries the same value.
+pub const RGB_MPP_TOTAL_TLV_TYPE: u64 = 65_539;
+
+fn mpp_totals_complete(
+	received_msat: u64, total_msat: u64, received_rgb: Option<u64>, total_rgb: Option<u64>,
+) -> bool {
+	received_msat >= total_msat && total_rgb.map_or(true, |expected| received_rgb == Some(expected))
+}
+
+/// Exposes the shared MPP completion check to the daemon's test harness.
+#[cfg(feature = "_rln_test_hooks")]
+pub fn test_mpp_totals_complete(
+	received_msat: u64, total_msat: u64, received_rgb: Option<u64>, total_rgb: Option<u64>,
+) -> bool {
+	mpp_totals_complete(received_msat, total_msat, received_rgb, total_rgb)
+}
+
 /// The number of ticks of [`ChannelManager::timer_tick_occurred`] where a peer is disconnected
 /// until we mark the channel disabled and gossip the update.
 pub(crate) const DISABLE_GOSSIP_TICKS: u8 = 10;
@@ -5296,12 +5315,25 @@ where
 		} else {
 			None
 		};
+		let mut recipient_onion = (*recipient_onion).clone();
 		let modified_path;
 		let path = if let Some(rgb_payment_info) = needs_rgb_modification {
+			if recipient_onion.custom_tlvs.iter().any(|(typ, _)| *typ == RGB_MPP_TOTAL_TLV_TYPE) {
+				return Err(APIError::APIMisuseError { err: "Reserved RGB MPP onion TLV was already set".to_owned() });
+			}
+			recipient_onion.custom_tlvs.push((RGB_MPP_TOTAL_TLV_TYPE,
+				rgb_payment_info.amount.to_be_bytes().to_vec()));
+			recipient_onion.custom_tlvs.sort_by_key(|(typ, _)| *typ);
 			modified_path = {
 				let mut p = path.clone();
+				let part_rgb = p.hops.last().and_then(|hop| hop.rgb_payment)
+					.unwrap_or((rgb_payment_info.contract_id, rgb_payment_info.amount));
+				if part_rgb.0 != rgb_payment_info.contract_id || part_rgb.1 == 0
+					|| part_rgb.1 > rgb_payment_info.amount {
+					return Err(APIError::InvalidRoute { err: "Invalid RGB path allocation".to_owned() });
+				}
 				for hop in &mut p.hops {
-					hop.rgb_payment = Some((rgb_payment_info.contract_id, rgb_payment_info.amount));
+					hop.rgb_payment = Some(part_rgb);
 				}
 				p
 			};
@@ -5319,7 +5351,7 @@ where
 				&path,
 				&session_priv,
 				total_value,
-				recipient_onion,
+				&recipient_onion,
 				cur_height,
 				payment_hash,
 				keysend_preimage,
@@ -7951,6 +7983,21 @@ where
 						($purpose: expr) => {{
 							let mut payment_claimable_generated = false;
 							let is_keysend = $purpose.is_keysend();
+							let rgb_total_tlv = onion_fields.custom_tlvs.iter()
+								.find(|(typ, _)| *typ == RGB_MPP_TOTAL_TLV_TYPE).map(|(_, value)| value);
+							let total_rgb = if let Some(value) = rgb_total_tlv {
+								if value.len() != 8 { fail_htlc!(claimable_htlc, payment_hash); }
+								Some(u64::from_be_bytes(value.as_slice().try_into().unwrap()))
+							} else { None };
+							if claimable_htlc.prev_hop.htlc_rgb_payment.is_some_and(|(_, amount)| amount == 0) {
+								fail_htlc!(claimable_htlc, payment_hash);
+							}
+							if let Some(total) = total_rgb {
+								if total == 0 || claimable_htlc.prev_hop.htlc_rgb_payment
+									.map_or(true, |(_, amount)| amount == 0 || amount > total) {
+									fail_htlc!(claimable_htlc, payment_hash);
+								}
+							}
 							let mut claimable_payments = self.claimable_payments.lock().unwrap();
 							if claimable_payments.pending_claiming_payments.contains_key(&payment_hash) {
 								fail_htlc!(claimable_htlc, payment_hash);
@@ -7970,6 +8017,13 @@ where
 								fail_htlc!(claimable_htlc, payment_hash);
 							}
 							if let Some(earlier_fields) = &mut claimable_payment.onion_fields {
+								let earlier_rgb_total = earlier_fields.custom_tlvs.iter()
+									.find(|(typ, _)| *typ == RGB_MPP_TOTAL_TLV_TYPE);
+								let new_rgb_total = onion_fields.custom_tlvs.iter()
+									.find(|(typ, _)| *typ == RGB_MPP_TOTAL_TLV_TYPE);
+								if earlier_rgb_total != new_rgb_total {
+									fail_htlc!(claimable_htlc, payment_hash);
+								}
 								if earlier_fields.check_merge(&mut onion_fields).is_err() {
 									fail_htlc!(claimable_htlc, payment_hash);
 								}
@@ -7978,6 +8032,28 @@ where
 							}
 							let mut total_value = claimable_htlc.sender_intended_value;
 							let mut earliest_expiry = claimable_htlc.cltv_expiry;
+							let mut rgb_contract = None;
+							let mut received_rgb = 0u64;
+							for part in claimable_payment.htlcs.iter().chain(core::iter::once(&claimable_htlc)) {
+								match part.prev_hop.htlc_rgb_payment {
+									Some((contract, amount)) if amount > 0 && rgb_contract.map_or(true, |id| id == contract) => {
+										rgb_contract = Some(contract);
+										if let Some(sum) = received_rgb.checked_add(amount) {
+											received_rgb = sum;
+										} else { fail_htlc!(claimable_htlc, payment_hash); }
+									},
+									None if total_rgb.is_none() => {},
+									_ => { fail_htlc!(claimable_htlc, payment_hash); },
+								}
+							}
+							if let Some(expected_rgb) = total_rgb {
+								if expected_rgb == 0 || received_rgb > expected_rgb {
+									fail_htlc!(claimable_htlc, payment_hash);
+								}
+							} else if received_rgb > 0 && !claimable_payment.htlcs.is_empty() {
+								// A multi-part RGB payment without the total cannot be safely claimed.
+								fail_htlc!(claimable_htlc, payment_hash);
+							}
 							for htlc in claimable_payment.htlcs.iter() {
 								total_value += htlc.sender_intended_value;
 								earliest_expiry = cmp::min(earliest_expiry, htlc.cltv_expiry);
@@ -7996,7 +8072,8 @@ where
 								log_trace!(self.logger, "Failing HTLC with payment_hash {} as payment is already claimable",
 									&payment_hash);
 								fail_htlc!(claimable_htlc, payment_hash);
-							} else if total_value >= claimable_htlc.total_msat {
+							} else if mpp_totals_complete(total_value, claimable_htlc.total_msat,
+								Some(received_rgb), total_rgb) {
 								#[allow(unused_assignments)] {
 									committed_to_claimable = true;
 								}
@@ -8496,26 +8573,29 @@ where
 						debug_assert!(false);
 						return false;
 					}
-					if let OnionPayload::Invoice { .. } = payment.htlcs[0].onion_payload {
-						// Check if we've received all the parts we need for an MPP (the value of the parts adds to total_msat).
-						// In this case we're not going to handle any timeouts of the parts here.
-						// This condition determining whether the MPP is complete here must match
-						// exactly the condition used in `process_pending_htlc_forwards`.
-						let htlc_total_msat =
-							payment.htlcs.iter().map(|h| h.sender_intended_value).sum();
-						if payment.htlcs[0].total_msat <= htlc_total_msat {
-							return true;
-						} else if payment.htlcs.iter_mut().any(|htlc| {
-							htlc.timer_ticks += 1;
-							return htlc.timer_ticks >= MPP_TIMEOUT_TICKS;
-						}) {
-							let htlcs = payment
-								.htlcs
-								.drain(..)
-								.map(|htlc: ClaimableHTLC| (htlc.prev_hop, *payment_hash));
-							timed_out_mpp_htlcs.extend(htlcs);
-							return false;
-						}
+					// Invoice and keysend MPPs are complete only after both totals arrive.
+					// This must match the receive check in `process_pending_htlc_forwards`.
+					let htlc_total_msat = payment.htlcs.iter().map(|h| h.sender_intended_value).sum();
+					let expected_rgb = payment.onion_fields.as_ref()
+						.and_then(|fields| fields.custom_tlvs.iter()
+							.find(|(typ, _)| *typ == RGB_MPP_TOTAL_TLV_TYPE))
+						.and_then(|(_, value)| <[u8; 8]>::try_from(value.as_slice()).ok())
+						.map(u64::from_be_bytes);
+					let received_rgb = payment.htlcs.iter().try_fold(0u64, |sum, htlc| {
+						htlc.prev_hop.htlc_rgb_payment
+							.and_then(|(_, amount)| sum.checked_add(amount))
+					});
+					if mpp_totals_complete(htlc_total_msat, payment.htlcs[0].total_msat,
+						received_rgb, expected_rgb) {
+						return true;
+					} else if payment.htlcs.iter_mut().any(|htlc| {
+						htlc.timer_ticks += 1;
+						htlc.timer_ticks >= MPP_TIMEOUT_TICKS
+					}) {
+						let htlcs = payment.htlcs.drain(..)
+							.map(|htlc: ClaimableHTLC| (htlc.prev_hop, *payment_hash));
+						timed_out_mpp_htlcs.extend(htlcs);
+						return false;
 					}
 					true
 				},
